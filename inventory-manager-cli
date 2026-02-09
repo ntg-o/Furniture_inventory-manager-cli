@@ -1,0 +1,914 @@
+import sqlite3
+import datetime
+from typing import Any, Optional
+import questionary
+from datetime import datetime
+import unicodedata
+
+
+db_path="furniture.db"
+
+#データベース接続
+def connect():
+    conn=sqlite3.connect(db_path)
+    conn.row_factory=sqlite3.Row
+    # 外部キー制約を有効化
+    conn.execute("PRAGMA foreign_key=ON;")
+    return conn
+
+
+#入力形式指定
+color_category_map = {"ホワイト": "white", "ブラック": "black", "グレー": "gray", "ブラウン": "brown",
+                      "ベージュ": "beige", "クリア": "clear", "レッド": "red", "ブルー": "blue",
+                      "グリーン": "green", "イエロー": "yellow", "オレンジ": "orange", "ピンク": "pink",
+                      "パープル": "purple", "ゴールド": "gold", "シルバー": "silver", 
+                      "マルチカラー": "multi color", "その他": "other"}
+
+material_category_map = {"レザー": "leather", "ファブリック": "fabric", "木材": "wood", 
+                         "金属": "metal", "ガラス": "glass", "石材": "stone", 
+                         "セラミック": "ceramic", "プラスチック": "plastic", "その他": "other"}
+                         
+allowed_status_type=["task_status","sales_status"]
+
+allowed_status_code=[]
+
+category_map = {"ソファ": "sofa", "ラウンジチェア": "lounge chair", "チェア": "chair",
+                "ベンチ": "bench", "スツール": "stool", "オットマン": "ottoman", "テーブル": "table"}
+                #1-1マスタ化（階層構造：家具 ＞ 椅子 ＞ スツール）
+
+sales_status_map={"準備中":"preparing",
+                  "販売中":"on_sale",
+                  "キープ中":"on_hold",
+                  "販売済み":"sold",
+                  "返品手続き中":"returning",
+                  "廃棄済み":"disposed",
+                  "棚卸損":"inventory_loss"}
+
+task_status_map={"入荷":"arrived",
+                 "検品":"inspection",
+                 "メンテナンス":"maintenance",
+                 "撮影":"photography",
+                 "出品":"listing",
+                 "梱包":"packing",
+                 "発送":"shipped"}
+
+location_map={"倉庫":"STOCK_ROOM",
+             "A店":"STORE_A",
+             "B店":"STORE_B",
+             "C店":"STORE_C",
+             "D店":"STORE_D",
+             "E店":"STORE_E",}
+
+
+
+#データもしくはNULL設定
+def clean_input(raw_value):
+    if raw_value is None:
+        return None
+    
+    value=unicodedata.normalize("NFKC",str(raw_value)).strip()
+    
+    if value in ["","-"]:
+        return None
+    return value
+
+#小数もしくはNULL設定
+def float_or_null(raw_value):
+    value=clean_input(raw_value)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return "ERROR"
+    
+#整数もしくはNULL設定
+def int_or_null(raw_value):
+    value=clean_input(raw_value)
+    if value is None:
+        return None
+    try:
+        return int(str(value).replace(",",""))
+    except (ValueError, TypeError):
+        return "ERROR"
+
+#日付表示形式
+def format_date_input(raw_date):
+    date=clean_input(raw_date)
+    if date is None:
+        return None 
+
+    formats=["%Y%m%d","%Y-%m-%d","%Y/%m%d"]
+
+    for format in formats:
+        try:
+            dt=datetime.strptime(date,format)
+            return dt.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+
+    return "ERROR"
+
+
+#ブランドマスタから取得/新しく追加
+import questionary
+def get_or_create_brand(conn):
+        cur=conn.cursor()
+        cur.execute("select brand_id,brand_name from brand_master where is_active = ? order by brand_id asc",
+                    (1,))
+        rows=cur.fetchall()
+        master_brand=[row["brand_name"] for row in rows]
+
+        choices=master_brand+["新規登録"]
+        selected=questionary.select("ブランドを選択してください：",choices=choices).ask()
+
+        
+        if selected=="新規登録":
+            new_brand=questionary.text("ブランド名は?").ask()
+            cur.execute("""insert into brand_master (brand_name, is_active)values(?,1)
+                        on conflict(brand_name) do update set brand_name = excluded.brand_name, is_active=1""",
+                        (new_brand,))
+            conn.commit()
+            
+            cur.execute("select brand_id from brand_master where brand_name=? and is_active =1",
+                        (new_brand,))
+            brand_id=cur.fetchone()["brand_id"]
+            return brand_id,new_brand
+        
+        cur.execute("select brand_id from brand_master where brand_name=? and is_active=1",
+                    (selected,))
+        brand_id=cur.fetchone()["brand_id"]
+        return brand_id,selected,
+
+        
+
+#プロダクトマスタから取得(ブランド名も)/新しく追加
+def get_or_create_product(conn,brand_id):
+    cur=conn.cursor()
+    
+    #マスタからプロダクト名とブランド名をセットで取得
+    cur.execute("""select p.product_name, b.brand_name 
+                from product_master p
+                join brand_master b on p.brand_id = b.brand_id
+                where p.brand_id=?
+                and p.is_active=1
+                and b.is_active=1
+                order by b.brand_name asc, p.product_name asc""",
+                (brand_id,))
+    master_product=[f"{row["product_name"]}（{row["brand_name"]}）" for row in cur.fetchall()]
+
+    choices=master_product+["新規登録"]
+    selected=questionary.select("プロダクトを選択してください：",choices=choices).ask()
+
+    #新規登録の場合（新しく追加）
+    if selected=="新規登録":
+        new_product=questionary.text("プロダクト名は?").ask().strip()
+        
+        cur.execute("""insert into product_master(brand_id,product_name, is_active)values(?,?,1)
+                    on conflict(brand_id, product_name)
+                    do update set product_name = excluded.product_name""" ,
+                (brand_id,new_product))
+        cur.execute("select product_id from product_master where brand_id=? and product_name=? and is_active=1",
+                    (brand_id,new_product))
+        product_id=cur.fetchone()["product_id"]
+        return product_id,new_product
+        
+    #既存の場合
+    else:
+        product_name_only=selected.split("（")[0]
+        cur.execute("select product_id from product_master where brand_id=? and product_name=? and is_active=?",
+                (brand_id,product_name_only,1))
+        row=cur.fetchone()
+        product_id=row["product_id"]
+        return product_id,product_name_only
+        
+    return selected
+    
+#デザイナーマスタから取得/新しく追加
+def get_or_creat_designer(conn,default_designer=None):
+    cur=conn.cursor()
+    cur.execute("select designer_id, designer_name from designer_master where is_active=? order by designer_name desc",
+                (1,))
+    rows=cur.fetchall()
+    master_designer=[row["designer_name"] for row in rows]
+
+    choices=master_designer+["新規登録"]
+    selected=questionary.select("デザイナーを選択して下さい",choices=choices,
+                                default=default_designer if default_designer in choices else None).ask()
+
+    if selected=="新規登録":
+        new_designer=questionary.text("デザイナー名は?").ask().strip()
+        cur.execute("""insert into designer_master (designer_name,is_active)values(?,1)
+                    on conflict(designer_name) do update set designer_name = excluded.designer_name""",
+                    (new_designer,))
+        cur.execute("select designer_id from designer_master where designer_name=? and is_active=1",
+                    (new_designer,))
+        designer_id=cur.fetchone()["designer_id"]
+        return designer_id,new_designer
+        
+    else:
+        cur.execute("select designer_id from designer_master where designer_name=? and is_active=1",
+                    (selected,))
+        designer_id=cur.fetchone()["designer_id"]
+        designer_name=selected
+        return designer_id,designer_name
+            
+        
+
+
+
+
+#テーブル作成（item / status_history / location_history / brand_master / product_master）
+def ensure_table():
+    with connect() as conn:
+        cur=conn.cursor()
+
+        #item（マスタ）
+        cur.execute("select name from sqlite_master where type='table' and name='item'")
+        exists=cur.fetchall()
+
+        cur.execute("""create table if not exists item(
+                    item_id integer primary key autoincrement,
+                    photo_path text,
+                    brand_id int,
+                    product_id int,
+                    color_official text,
+                    color_category text,
+                    material_official text,
+                    material_category text,
+                    category text,
+                    designer_id int,
+                    price int,
+                    size_w real,
+                    size_d real,
+                    size_h real,
+                    size_sh real,                    
+                    vendor_id int,
+                    purchase_at text,
+                    purchase_price int,
+                    created_at text,
+                    is_active int)""")
+        
+        if not exists:
+            print("アイテムテーブルを作成しました")
+        conn.commit()    
+
+
+        #ステータス履歴
+        cur.execute("select name from sqlite_master where type='table' and name='status_history'")
+        exists=cur.fetchall()
+        
+        cur.execute("""create table if not exists status_history(
+                    status_history_id integer primary key autoincrement,
+                    item_id int,
+                    status_type text,
+                    status_code text,
+                    changed_at text,
+                    changed_by text,
+                    note text)""")
+        
+        if not exists:
+            print("ステータス履歴テーブルを作成しました")
+        conn.commit()
+        
+
+        #ロケーション履歴
+        cur.execute("select name from sqlite_master where type='table' and name='location_history'")
+        exists=cur.fetchall()
+
+        cur.execute("""create table if not exists location_history(
+                    location_history_id integer primary key autoincrement,
+                    item_id int,
+                    from_location_id text,
+                    to_location_id text,
+                    moved_at text,
+                    moved_by text,
+                    note text)""")
+        if not exists:
+            print("ロケーション履歴テーブルを作成しました")
+        conn.commit()
+        
+
+        #出品
+        cur.execute("select name from sqlite_master where type='table' and name='listing'")
+        exists=cur.fetchall()
+
+        cur.execute("""create table if not exists listing(
+                    listing_id integer primary key autoincrement,
+                    item_id int,
+                    channel text,
+                    listing_price int,
+                    listing_at text,
+                    listing_status text,
+                    url text,
+                    plattform_fee_rate real,
+                    active int)""")
+        
+        if not exists:
+            print("出品テーブルを作成しました")
+        conn.commit()
+
+
+        #ブランドマスタ
+        cur.execute("select name from sqlite_master where type='table' and name='brand_master'")
+        exists=cur.fetchall()
+
+        cur.execute("""create table if not exists brand_master(
+                    brand_id integer primary key autoincrement,
+                    brand_name text unique collate nocase,
+                    brand_name_kana text,
+                    brand_description,
+                    is_active int)""")
+        if not exists:
+            print("ブランドマスタテーブルを作成しました")
+        conn.commit()
+        
+
+        #プロダクトマスタ
+        cur.execute("select name from sqlite_master where type='table' and name='product_master'")
+        exists=cur.fetchall()
+
+        cur.execute("""create table if not exists product_master(
+                    product_id integer primary key autoincrement,
+                    brand_id int,
+                    product_name text collate nocase,
+                    product_name_kana text,
+                    designer_id int,
+                    product_description,
+                    official_site text,
+                    is_active int,
+                    unique(brand_id,product_name),
+                    foreign key(brand_id) references brand_master(brand_id),
+                    foreign key (designer_id) references designer_master(designer_id))""")   
+        if not exists:
+            print("プロダクトマスタテーブルを作成しました")
+        conn.commit()   
+
+        #デザイナーマスタ
+        cur.execute("select name from sqlite_master where type='table' and name='designer_master'")
+        exists=cur.fetchall()
+
+        cur.execute("""create table if not exists designer_master(
+                    designer_id integer primary key autoincrement,
+                    designer_name text unique collate nocase,
+                    designer_name_kana text,
+                    nationality text,
+                    is_active int)""")
+        
+        if not exists:
+            print("デザイナーマスタテーブルを作成しました")
+        conn.commit()
+
+
+
+
+#テーブルを作り直す
+def rebuild_table(table_name:str):
+        with connect() as conn:
+            cur=conn.cursor()
+            cur.execute(f"drop table if exists {table_name}")
+            conn.commit()
+            print(f"{table_name}テーブルを削除しました")
+
+        ensure_table()
+
+
+
+#1-1 CREATE
+def add_item(conn,photo_path:str,brand_id:int,product_id:int,category:str,price:int,vendor_id:int,purchase_at:str,purchase_price:int):
+        cur=conn.cursor()
+
+        cur.execute("""insert into item (
+                    photo_path,brand_id,product_id,category,price,vendor_id,purchase_at,purchase_price,created_at,is_active)
+                    values(?,?,?,?,?,?,?,?,datetime('now'),1)""",
+                   (clean_input(photo_path),
+                    brand_id,
+                    product_id,
+                    category,
+                    float_or_null(price),
+                    clean_input(vendor_id),
+                    clean_input(purchase_at),
+                    float_or_null(purchase_price)))
+        
+        item_id=cur.lastrowid
+
+        #ステータス履歴に登録
+        #タスクステータス＝arrived
+        cur.execute("""insert into status_history(
+                    item_id,status_type,status_code,changed_at)
+                    values(?,'task_status','arrived',datetime('now'))""",
+                    (item_id,))
+        #セールスステータス＝preparing
+        cur.execute("""insert into status_history(
+                    item_id,status_type,status_code,changed_at)
+                    values(?,'sales_status','preparing',datetime('now'))""",
+                    (item_id,))
+        
+        #ロケーション履歴に登録
+        cur.execute("""insert into location_history(
+                    item_id,from_location_id,to_location_id,moved_at)
+                    values(?,?,'STOCK_ROOM',?)""",
+                    (item_id,vendor_id,purchase_at))
+        
+        return item_id
+
+
+#1-2 CREATE-インタラクティブ
+def interactive_add_item():
+    while True:
+        with connect() as conn:
+            cur=conn.cursor()
+            print("商品を登録します")
+            photo_path=questionary.text("画像URL：").ask()
+
+            brand_id,brand_name=get_or_create_brand(conn)
+            product_id,product_name=get_or_create_product(conn,brand_id)
+
+            category_jp=questionary.select("カテゴリー選択：",choices=list(category_map)).ask()
+            category=category_map[category_jp]
+            while True:
+                raw_price=questionary.text("販売価格：").ask()
+                price=int_or_null(raw_price)
+                if price=="ERROR":
+                    print("※数字で入力してください")
+                    continue
+                break
+            vendor_id=questionary.text("仕入先：").ask()
+            while True:
+                raw_purchase_at=questionary.text("仕入日(YYYYmmdd)：").ask()
+                purchase_at=format_date_input(raw_purchase_at)
+                if purchase_at=="ERROR":
+                    print("※正しい日付形式で入力してください（例: 20260131,2026-01-31,2026/01/31）")
+                    continue
+                break
+            while True:
+                raw_purchase_price=questionary.text("仕入価格：").ask()
+                purchase_price=int_or_null(raw_purchase_price)
+                if purchase_price=="ERROR":
+                    print("※数字で入力してください")
+                    continue
+                break
+
+            item_id=add_item( 
+                conn=conn,
+                photo_path=photo_path,
+                brand_id=brand_id,
+                product_id=product_id,
+                category=category,
+                price=price,
+                vendor_id=vendor_id,
+                purchase_at=purchase_at,
+                purchase_price=purchase_price)
+            
+            print(f"商品を追加しました {item_id}/{brand_name}/{product_name}")            
+        
+        answer=questionary.select("続けて追加しますか?",choices=["YES","NO"]).ask()
+        if answer=="NO":
+            break
+
+
+        
+
+#2-1 READ
+def list_item():
+    with connect() as conn:
+        cur=conn.cursor()
+
+        query="""select i.item_id, b.brand_name, p.product_name, i.category, i.price,
+            (select sh.status_code
+            from status_history sh
+            where sh.item_id = i.item_id
+              and status_type = 'task_status'
+            order by sh.changed_at desc
+            limit 1) as task_status_code,
+
+            (select sh.status_code
+            from status_history sh
+            where sh.item_id = i.item_id
+              and status_type = 'sales_status'
+            order by sh.changed_at desc
+            limit 1) as sales_status_code,
+
+            (select lh.to_location_id
+            from location_history lh
+            where lh.item_id = i.item_id
+            order by lh.moved_at desc, lh.location_history_id desc
+            limit 1) as location
+        
+        from item i
+        left join brand_master b on i.brand_id = b.brand_id
+        left join product_master p on i.product_id = p.product_id
+        where i.is_active=1
+        order by i.item_id asc"""
+
+        cur.execute(query)
+        rows=cur.fetchall()
+
+        header=f"{'ID':<6}|{'BRAND':<10}|{'NAME':<15}|{'CATEGORY':<20}|{'PRICE':<10}|{'LOCATION':<12}|{'TASK STATUS':<12}|{'SALES STATUS':<12}"
+        print(f"\n{header}")
+        print("-"*len(header))
+        for row in rows:
+            print(f"{row['item_id']:<6}|{row['brand_name']:<10}|{row['product_name']:<15}|{row['category']:<20}|{str(row['price'] or''):<10}|{row['location']:<12}|{row['task_status_code']:<12}|{row['sales_status_code']:<12}")
+
+#2-2 READ（その他のテーブル）
+def list_table(table_name:str):
+    with connect() as conn:
+        cur=conn.cursor()
+
+        cur.execute(f"pragma table_info({table_name})")
+        columns=[row[1] for row in cur.fetchall()]
+
+        if "is_active" in columns:
+            qurry=f"select* from {table_name} where is_active=1"
+        else:
+            qurry=f"select* from {table_name}"
+
+        cur.execute(qurry)
+        rows=cur.fetchall()
+        print(f"{table_name}")
+        for row in rows:
+            print(list(row))
+
+
+
+#3-1 UPDATE
+field_map = {
+    "画像URL":"photo_path",
+    "ブランド名/商品名": "product(brand/name)",
+    "カラー": "color",
+    "素材": "material",
+    "カテゴリー": "category",
+    "デザイナー": "designer",
+    "販売価格": "price",
+    "サイズ": "size",
+    "仕入先ID": "vendor_id",
+    "購入日": "purchase_at",
+    "購入価格": "purchase_price",
+    "販売ステータス": "sales_status",
+    "ロケーション": "to_location_id"}
+
+field_map_inv={value: key for key, value in field_map.items()}
+
+def update_item_field(item_id:int,field:str,value:Any,moved_at:str,changed_by:str,conn)->None:
+        cur=conn.cursor()
+        if field not in field_map.values():
+            print(f"{field}項目は変更できません")
+            return
+        
+        value=clean_input(value)
+        moved_at=clean_input(moved_at)
+        changed_by=clean_input(changed_by)
+
+        #プロダクト（ブランド名/プロダクト名）の場合
+        if field =="product(brand/name)":
+                brand_id=value["brand_id"]
+                product_id=value["product_id"]
+                
+                cur.execute("update item set brand_id=?,product_id=? where item_id=?",
+                        (brand_id,product_id,item_id))
+            
+        #カラーの場合
+        elif field=="color":
+            cur.execute("update item set color_official=?, color_category=? where item_id=?",
+                        (value["color_official"],value["color_category"],item_id))
+            
+        #素材の場合
+        elif field=="material":
+            cur.execute("update item set material_official=?, material_category=? where item_id=?",
+                        (value["material_official"],value["material_category"],item_id))
+                
+        #デザイナー更新の場合
+        elif field=="designer":
+            cur.execute("select product_id from item where item_id=? and is_active=1",
+                        (item_id,))
+            p_row=cur.fetchone()
+            product_id=p_row["product_id"]
+
+            cur.execute("update product_master set designer_id=? where product_id=?",
+                            (value["designer_id"],product_id))
+            cur.execute("update item set designer_id=? where product_id=?",
+                            (value["designer_id"],product_id))
+                
+            
+        #サイズ更新の場合
+        elif field=="size":
+            cur.execute("update item set size_w=?,size_d=?,size_h=?,size_sh=? where item_id=?",
+                        (value["w"],value["d"],value["h"],value["sh"],item_id))
+            
+
+        #セールスステータスの更新の場合
+        elif field =="sales_status":
+            cur.execute("""insert into status_history(
+                        item_id,status_type,status_code,changed_at,changed_by)
+                        values(?,"sales_status",?,datetime('now'),?)""",
+                        (item_id,value,changed_by) )
+
+        #ロケーションの更新の場合
+        elif field =="to_location_id":
+            cur.execute("""insert into location_history(
+                        item_id,to_location_id,moved_at,moved_by)
+                        values(?,?,?,?)""",
+                        (item_id,value,moved_at,changed_by))
+            
+        #その他の場合
+        else:
+            cur.execute(f"update item set {field}=? where item_id=?",
+                    (value,item_id),)
+        
+        conn.commit()
+
+
+#現在値
+def get_current_value(item_id,field):
+    if field not in field_map.values():
+        return None
+    
+    with connect() as conn:
+        cur=conn.cursor()
+        cur.execute(f"select {field} from item where item_id=?",
+                    (item_id,)) 
+        row=cur.fetchone()
+        if row:
+            current_value=row[field] or ""
+            return current_value
+        
+        return None
+
+#3-2 UPDATE-インタラクティブ
+def interactive_update_item():
+    all_pending_update_item=[]
+
+    with connect() as conn:
+        cur=conn.cursor()
+        print("データを更新します")
+
+        while True:
+            break_all=False
+
+            item_id_srt=questionary.text("変更するアイテムのID：").ask()
+            item_id=int(item_id_srt) if item_id_srt.isdigit() else print("有効なIDを入力してください")
+
+            while True:
+                choices=list(field_map.keys())+["■戻る"]+["■保存して終了する"]
+                display_field=questionary.select(f"ID:{item_id}\n変更項目：",choices=choices).ask()
+
+                #戻る
+                if display_field=="■戻る":
+                    break
+
+                #終了
+                elif display_field=="■保存して終了する":
+                    break_all=True
+                    break
+
+                field=field_map[display_field]
+                value=None
+                moved_at=None
+
+                #プロダクト（ブランド名/プロダクト名）の場合
+                if field=="product(brand/name)":
+                    #ブランド
+                    brand_id,brand_name=get_or_create_brand(conn)
+                    #アイテム
+                    product_id,product_name=get_or_create_product(conn,brand_id)
+                
+                    value={"brand_id":brand_id,
+                           "product_id":product_id}
+                    
+                    value_jp={"ブランド名":brand_name,
+                              "プロダクト名":product_name}
+
+
+                #カラーの場合
+                elif field=="color":
+                    cur.execute("select color_official,color_category from item where item_id=?",
+                                (item_id,))
+                    row=cur.fetchone()
+
+                    color_official=questionary.text("公式カラー：",default=str(row["color_official"] or "")).ask()
+                    color_category_list_jp=questionary.checkbox("カラーカテゴリー：",choices=list(color_category_map)).ask()
+                    color_category_jp=",".join(color_category_list_jp)
+                    color_category_list_en=[color_category_map[jp] for jp in color_category_list_jp]
+                    color_category=",".join(color_category_list_en)
+
+                    value={"color_official":color_official,
+                           "color_category":color_category}
+                    
+                    value_jp={"公式カラー":color_official,
+                              "カラーカテゴリー":color_category_jp}
+                
+                #素材の場合
+                elif field=="material":
+                    cur.execute("select material_official, material_category from item where item_id=?",
+                                (item_id,))
+                    row=cur.fetchone()
+                    material_official=questionary.text("公式素材：",default=str(row["material_official"] or "")).ask()
+                    material_category_list_jp=questionary.checkbox("素材カテゴリー：",choices=list(material_category_map)).ask()
+                    material_category_jp=",".join(material_category_list_jp)
+                    material_category_list_en=[material_category_map[jp] for jp in material_category_list_jp]
+                    material_category=",".join(material_category_list_en)
+
+                    value={"material_official":material_official,
+                           "material_category":material_category}
+                    
+                    value_jp={"公式素材":material_official,
+                              "素材カテゴリー":material_category_jp}
+
+                #カテゴリーの場合
+                elif field=="category":
+                    value_jp=questionary.select("カテゴリー：",choices=list(category_map)).ask()
+                    value=category_map[value_jp]
+
+                #デザイナーの場合
+                elif field=="designer":
+                    cur.execute("""select p.product_id, d.designer_name from item i
+                                join product_master p on i.product_id=p.product_id
+                                left join designer_master d on p.designer_id= d.designer_id
+                                where i.item_id=?""",
+                                (item_id,))
+                    row=cur.fetchone()
+                    default_designer=row["designer_name"] if row else None
+                
+                    designer_id,designer_name=get_or_creat_designer(conn,default_designer)
+
+                    value={"designer_id":designer_id,
+                           "designer_name":designer_name}
+                    
+                    value_jp=designer_name
+
+                #サイズ更新の場合
+                elif field=="size":
+                    cur.execute("select size_w, size_d, size_h, size_sh from item where item_id=?",
+                                (item_id,))
+                    row=cur.fetchone()
+    
+                    size_w = questionary.text("幅:",default=str(row["size_w"] or "")).ask()
+                    size_d = questionary.text("奥行:",default=str(row["size_d"] or "")).ask()
+                    size_h = questionary.text("高さ:",default=str(row["size_h"] or "")).ask()
+                    size_sh = questionary.text("座高:",default=str(row["size_sh"] or "")).ask()
+                
+                    value={"w":float_or_null(size_w),
+                           "d":float_or_null(size_d),
+                           "h":float_or_null(size_h),
+                           "sh":float_or_null(size_sh)}
+                    
+                    value_jp={"幅":float_or_null(size_w),
+                              "奥行":float_or_null(size_d),
+                              "高さ":float_or_null(size_h),
+                              "座高":float_or_null(size_sh)}
+                
+                #セールスステータスの場合
+                elif field=="sales_status":
+                    value_jp=questionary.select("ステータス：",choices=list(sales_status_map)).ask()
+                    value=sales_status_map[value_jp]
+
+                #ロケーション更新の場合
+                elif field=="to_location_id":
+                    choices=list(location_map.keys())+["その他"]
+                    value_jp=questionary.select("移動先：",choices=choices).ask()
+                    if value_jp=="その他":
+                         value=questionary.text().ask()
+                         value_jp=value
+
+                    value=location_map[value_jp]
+                     
+                    moved_at=questionary.text("移動日(YYYYMMDD)：").ask()
+
+
+                #その他項目の場合
+                else:
+                    current_value=get_current_value(item_id,field)
+                    raw_value=questionary.text("変更内容：",default=str(current_value)).ask()
+                    value=clean_input(raw_value)
+
+
+                all_pending_update_item.append({"item_id":item_id,
+                                                "field":field,
+                                                "field_jp":field_map_inv.get(field,field),
+                                                "value":value,
+                                                "value_jp":value_jp if 'value_jp' in locals() else value,
+                                                "moved_at":moved_at})
+
+                answer_1=questionary.select("次の操作を選択して下さい",choices=["他の項目を続けて更新する","他のアイテムを更新する","変更内容を保存して終了する"]).ask()
+                if answer_1=="他の項目を続けて更新する":
+                    continue
+
+                elif answer_1=="他のアイテムを更新する":
+                    break
+
+                elif answer_1=="変更内容を保存して終了する":
+                    break_all=True
+                    break
+                    
+                    
+            if break_all:
+                break
+
+
+        if all_pending_update_item:
+            changed_by=questionary.text("変更者：").ask()
+            for up in all_pending_update_item:
+                display_value=up["value"]
+                if isinstance(display_value,dict):
+                    display_value=",".join([f"{k}:{v}" for  k, v in display_value.items()])
+
+                moved_at_line=f"\n移動日:{up['moved_at']}" if up.get('moved_at')  else ""   
+                confirm=questionary.select(f"【変更内容】"
+                                           f"\nアイテムID：{up['item_id']}"
+                                           f"\n{up['field_jp']}:{up['value_jp']}"
+                                           f"{moved_at_line}"
+                                           f"\n変更者:{changed_by}"
+                                           f"\nこの内容で保存しますか？",
+                                           choices=["はい","修正する"]).ask()
+                                                            #※
+                if confirm=="はい":
+                    update_item_field(item_id=up["item_id"],
+                            field=up["field"],
+                            value=up["value"],
+                            moved_at=up["moved_at"],
+                            changed_by=changed_by,
+                            conn=conn)
+                    print("変更を保存しました")
+                else:
+                    continue
+
+                conn.commit()
+
+
+table_map={"アイテムマスタ":"item",
+           "ブランドマスタ":"brand_master",
+           "プロダクトマスタ":"product_master",
+           "デザイナーマスタ":"designer_master"}       
+
+id_column_map={"item":"item_id",
+               "brand_master":"brand_id",
+               "product_master":"product_id",
+               "designer_master":"designer_id"}         
+                
+#DELETE(倫理削除)
+def delete_record(conn,target_table,target_column,target_id):
+        cur=conn.cursor()
+        cur.execute(f"update {target_table} set is_active=? where {target_column}=?",
+                    (0,target_id,))
+        conn.commit()
+
+#DELETE インタラクティブ
+def interactive_delete_record():
+    with connect() as conn:
+        cur=conn.cursor()
+        print("データを削除します")
+
+        target_table_jp=questionary.select("削除するテーブル:",choices=list(table_map.keys())).ask()
+        target_table=table_map[target_table_jp]
+        
+        target_column=id_column_map[target_table]
+        target_id=questionary.text("削除するID:").ask()
+        try:
+            target_id=int(target_id)
+        except ValueError:
+            print("IDは数値で入力してください")
+            return
+
+        confirm=questionary.confirm(f"本当に削除しますか?\n対象：{target_table_jp}\nID：{target_id}").ask()
+        if confirm:
+            delete_record(conn,target_table,target_column,target_id)
+        else:
+            print("キャンセルしました")
+
+
+
+
+
+if __name__=="__main__":
+    
+    #テーブル作成
+    #ensure_table()
+
+    #rebuild_table("item")
+    #rebuild_table("status_history")
+    #rebuild_table("location_history")
+    #rebuild_table("status_history")
+    #rebuild_table("brand_master")
+    #rebuild_table("product_master")
+    #rebuild_table("designer_master")
+
+    #アイテム追加
+    #interactive_add_item()  
+
+     #情報更新
+    #interactive_update_item()
+
+    #削除
+    interactive_delete_record()
+
+    #リスト表示
+    list_item()
+    list_table("item")
+    list_table("status_history")
+    list_table("location_history")
+    list_table("listing")
+    list_table("brand_master")
+    list_table("product_master")
+    list_table("designer_master")
+
+
